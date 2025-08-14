@@ -14,16 +14,20 @@ use core::future::{poll_fn, Future};
 use core::mem::take;
 use core::pin::pin;
 use core::task::{Poll, Waker};
+use spin;
 
 use crate::{
     config, AppCookie, Fragmenter, MctpHeader, MctpMessage, SendOutput, Stack,
     MAX_MTU, MAX_PAYLOAD,
 };
-use mctp::{Eid, Error, MsgIC, MsgType, Result, Tag, TagValue};
+use mctp::{
+    Eid, Error, MsgIC, MsgType, ReqChannel, RespChannel, Result, Tag, TagValue,
+};
 
 use crate::zerocopy_channel::{FixedChannel, Receiver};
 use embassy_sync::waitqueue::{AtomicWaker, WakerRegistration};
 
+// use crossbeam_queue::SegQueue;
 use heapless::{Entry, FnvIndexMap, Vec};
 
 /// Maximum number of listeners per `Router`.
@@ -113,6 +117,7 @@ impl core::ops::Deref for PktBuf {
 /// The "producer" side of a queue of packets to send out a MCTP port/interface.
 ///
 /// It will be used by `Routing` to enqueue packets to a port.
+#[cfg(feature = "async")]
 pub struct PortTop {
     /// Forwarded packet queue.
     channel: FixedChannel<PortRawMutex, PktBuf, { config::PORT_TXQUEUE }>,
@@ -122,7 +127,19 @@ pub struct PortTop {
     sender_waker: AtomicWaker,
 }
 
+// Afaik hubris also uses spin with Mutex and MutexGuard so this should be ok to port later.
+// But since this should be upstreamed, it should also be generic in the type of mutex it uses.
+//
+// Does it even make sense to use channles or should we maybe just use queues?
+#[cfg(not(feature = "async"))]
+pub struct PortTop {
+    // rx: uchan::Receiver<PktBuf>,
+    // tx: uchan::Sender<PktBuf>,
+    packet_queue: crossbeam_queue::SegQueue<PktBuf>,
+}
+
 impl PortTop {
+    #[cfg(feature = "async")]
     pub fn new() -> Self {
         Self {
             channel: FixedChannel::new(),
@@ -131,12 +148,37 @@ impl PortTop {
         }
     }
 
+    #[cfg(not(feature = "async"))]
+    pub fn new() -> Self {
+        // let (tx, rx): (
+        //     uchan::RawSender<PktBuf>,
+        //     uchan::RawReceiver<uchan::StdEvent, PktBuf>,
+        // ) = uchan::channel();
+        // Self { rx, tx }
+        Self {
+            packet_queue: SegQueue::new(),
+        }
+    }
+
     /// Return the bottom half port for the channel.
     ///
     /// Applications call Router::port().
     /// Returns None if already borrowed. `id` is not checked, just passed through.
+    #[cfg(feature = "async")]
     fn bottom(&self, id: PortId) -> Option<Port<'_>> {
         self.channel.receiver().map(|packets| Port { packets, id })
+    }
+
+    /// Return the bottom half port for the channel.
+    ///
+    /// Applications call Router::port().
+    /// Returns None if already borrowed. `id` is not checked, just passed through.
+    #[cfg(not(feature = "async"))]
+    fn bottom(&self, id: PortId) -> Option<Port> {
+        // match self.rx.recv() {
+        //     Ok(packets) => return Some(Port { packets, id }),
+        //     _ => None,
+        // }
     }
 
     /// Enqueues a packet.
@@ -144,6 +186,7 @@ impl PortTop {
     /// Do not call with locks held.
     /// May block waiting for a port queue to flush.
     /// Packet must be a valid MCTP packet, may panic otherwise.
+    #[cfg(feature = "async")]
     async fn forward_packet(&self, pkt: &[u8]) -> Result<()> {
         debug_assert!(MctpHeader::decode(pkt).is_ok());
 
@@ -170,6 +213,34 @@ impl PortTop {
         });
         self.sender_waker.wake();
         r
+    }
+
+    #[cfg(not(feature = "async"))]
+    fn forward_packet(&self, pkt: &[u8]) -> Result<()> {
+        debug_assert!(MctpHeader::decode(pkt).is_ok());
+
+        // With forwarded packets we don't want to block if
+        // the queue is full (we drop packets instead).
+        // OK unwrap, we have the send_mutex
+        // leongross: model that drop
+        // Get a slot to send
+
+        // uchan has no try_send, so wrap it here
+        // embassy: return immediately if channel is full
+        // --> uchan channel buffers infinitely and has no size -> ERR
+        let slot = self.tx.try_send().ok_or_else(|| {
+            debug!("Dropped forward packet");
+            Error::TxFailure
+        })?;
+
+        // Fill the buffer
+        if slot.set(pkt).is_ok() {
+            sender.send_done();
+            Ok(())
+        } else {
+            debug!("Oversized forward packet");
+            Err(Error::TxFailure)
+        }
     }
 
     /// Fragments and enqueues a message.
@@ -249,12 +320,21 @@ impl Default for PortTop {
 ///
 /// An MCTP transport implementation will read packets to send with
 /// [`outbound()`](Self::outbound).
+#[cfg(feature = "async")]
 pub struct Port<'a> {
     /// packet queue
     packets: Receiver<'a, PortRawMutex, PktBuf>,
     id: PortId,
 }
 
+#[cfg(not(feature = "async"))]
+pub struct Port {
+    /// packet queue
+    packets: uchan::Receiver<PktBuf>,
+    id: PortId,
+}
+
+#[cfg(feature = "async")]
 impl Port<'_> {
     /// Retrieve an outbound packet to send for this port.
     ///
@@ -299,10 +379,46 @@ impl Port<'_> {
     }
 }
 
+#[cfg(not(feature = "async"))]
+impl Port {
+    /// Retrieve an outbound packet to send for this port.
+    ///
+    /// Should call [`outbound_done()`](Self::outbound_done) to consume the
+    /// packet and advance the queue.
+    /// `outbound()` may be called multiple times to peek at the same packet.
+    /// Also returns the destination EID.
+    pub fn outbound(&mut self) -> (&[u8], Eid) {
+        let pkt = self.packets.recv().unwrap();
+        // OK unwrap, checked by channel sender
+        let dest = MctpHeader::decode(&pkt).unwrap().dest;
+        return (pkt.clone(), dest.clone());
+    }
+
+    /// Retrieve the `PortId`.
+    pub fn id(&self) -> PortId {
+        self.id
+    }
+
+    /// Attempt to retrieve an outbound packet.
+    ///
+    /// This is the same as [`outbound()`](Self::outbound) but returns
+    /// `None` immediately if not available.
+    ///
+    /// Should call [`outbound_done()`](Self::outbound_done) to consume the
+    /// packet and advance the queue.
+    /// `try_outbound()` may be called multiple times to peek at the same packet.
+    pub fn try_outbound(&mut self) -> Option<(&[u8], Eid)> {
+        let pkt = self.packets.try_recv().unwrap();
+        let dest = MctpHeader::decode(&pkt).unwrap().dest;
+        Some((&pkt.data, dest))
+    }
+}
+
 #[derive(Default)]
 struct WakerPoolInner {
     // Value is None for AppCookies that are pending deallocation.
     // Deallocation is deferred since it needs an async lock on the stack.
+    // leongross: TODO: do we have to adapt this deallocation synchronously somewhere?
     pool: FnvIndexMap<AppCookie, Option<WakerRegistration>, MAX_CHANNELS>,
 
     /// Next AppCookie to allocate. Arbitrary, but incrementing
@@ -441,6 +557,7 @@ impl WakerPool {
 ///
 /// Outbound packets are provided to a transport's `Port` instance,
 /// returned by [`port()`](Self::port).
+#[cfg(feature = "async")]
 pub struct Router<'r> {
     inner: AsyncMutex<RouterInner<'r>>,
     ports: Vec<&'r mut PortTop, { config::MAX_PORTS }>,
@@ -458,13 +575,30 @@ pub struct Router<'r> {
     work_msg: AsyncMutex<Vec<u8, MAX_PAYLOAD>>,
 }
 
+#[cfg(not(feature = "async"))]
+pub struct Router<'r> {
+    inner: spin::Mutex<RouterInner<'r>>,
+    ports: Vec<&'r mut PortTop, { config::MAX_PORTS }>,
+
+    /// Listeners for different message types.
+    // Has a separate non-async Mutex so it can be used by RouterAsyncListener::drop()
+    // TODO filter by more than just MsgType
+    // leongross: change this to spin::mutex/make it generic
+    app_listeners:
+        BlockingMutex<RefCell<Vec<(MsgType, AppCookie), MAX_LISTENERS>>>,
+
+    /// Temporary storage to flatten vectorised local sent messages
+    // prior to fragmentation and queueing.
+    work_msg: AsyncMutex<Vec<u8, MAX_PAYLOAD>>,
+}
+
+//leongross: we can leave this as
 pub struct RouterInner<'r> {
     /// Core MCTP stack
     stack: Stack,
 
     /// Minimum receive deadline. u64::MAX when cleared.
     recv_deadline: u64,
-
     lookup: &'r dyn PortLookup,
 }
 
@@ -478,6 +612,7 @@ impl<'r> Router<'r> {
     ///
     /// `now_millis` is the current timestamp, as would be provided to
     /// [`update_time`](Self::update_time).
+    #[cfg(feature = "async")]
     pub fn new(
         own_eid: Eid,
         lookup: &'r dyn PortLookup,
@@ -501,6 +636,29 @@ impl<'r> Router<'r> {
         }
     }
 
+    #[cfg(not(feature = "async"))]
+    pub fn new(
+        own_eid: Eid,
+        lookup: &'r dyn PortLookup,
+        now_millis: u64,
+    ) -> Self {
+        let stack = Stack::new(own_eid, now_millis);
+        let inner = RouterInner {
+            stack,
+            recv_deadline: u64::MAX,
+            lookup,
+        };
+
+        let app_listeners = BlockingMutex::new(RefCell::new(Vec::new()));
+
+        Self {
+            inner: spin::Mutex::new(inner),
+            app_listeners,
+            ports: Vec::new(),
+            work_msg: AsyncMutex::new(Vec::new()),
+        }
+    }
+
     pub fn add_port(&mut self, top: &'r mut PortTop) -> Result<PortId> {
         self.ports.push(top).map_err(|_| Error::NoSpace)?;
         Ok(PortId((self.ports.len() - 1) as u8))
@@ -509,7 +667,7 @@ impl<'r> Router<'r> {
     /// Return a port.
     ///
     /// A port may only be borrowed once (may be reborrowed after dropping).
-    pub fn port(&self, id: PortId) -> Result<Port<'_>> {
+    pub fn port(&self, id: PortId) -> Result<Port> {
         let port = self.ports.get(id.0 as usize).ok_or_else(|| {
             debug!("Bad port index");
             Error::BadArgument
@@ -524,6 +682,7 @@ impl<'r> Router<'r> {
     ///
     /// A suitable interval (milliseconds) for the next call to `update_time()` will
     /// be returned, currently a maximum of 100 ms.
+    #[cfg(feature = "async")]
     pub async fn update_time(&self, now_millis: u64) -> Result<u64> {
         let mut inner = self.inner.lock().await;
         let (next, mut expired) = inner.stack.update(now_millis)?;
@@ -544,12 +703,31 @@ impl<'r> Router<'r> {
         Ok(next)
     }
 
+    #[cfg(not(feature = "async"))]
+    pub fn update_time(&self, now_millis: u64) -> Result<u64> {
+        let mut inner = self.inner.lock();
+        let (next, mut expired) = inner.stack.update(now_millis)?;
+
+        if inner.recv_deadline <= now_millis {
+            expired = true;
+            // app_recv() will update with next minimum deadline.
+            inner.recv_deadline = u64::MAX;
+        }
+
+        if expired {
+            trace!("update_time expired");
+        }
+
+        Ok(next)
+    }
+
     /// Provide an incoming packet to the router.
     ///
     /// This expects a single MCTP packet, with no transport binding header.
     ///
     /// Returns the packet's MCTP source EID for any valid packet,
     /// regardless of whether the packet is handled, forwarded, or dropped.
+    #[cfg(feature = "async")]
     pub async fn inbound(&self, pkt: &[u8], port: PortId) -> Option<Eid> {
         let mut inner = self.inner.lock().await;
 
@@ -601,6 +779,64 @@ impl<'r> Router<'r> {
         ret_src
     }
 
+    /// Provide an incoming packet to the router.
+    ///
+    /// This expects a single MCTP packet, with no transport binding header.
+    ///
+    /// Returns the packet's MCTP source EID for any valid packet,
+    /// regardless of whether the packet is handled, forwarded, or dropped.
+    #[cfg(not(feature = "async"))]
+    pub fn inbound(&self, pkt: &[u8], port: PortId) -> Option<Eid> {
+        let mut inner = self.inner.lock();
+
+        let header = MctpHeader::decode(pkt).ok()?;
+        // Source EID is returned even if packet routing fails
+        let ret_src = Some(header.src);
+
+        // Handle locally if possible
+        if inner.stack.is_local_dest(pkt) {
+            // Clean up any outstanding reassembly slots, to ensure
+            // they don't prevent the new packet being received.
+            // This is cheap.
+            // leongross: not sure how to get the cookie here, so jsut use Eid and Tags?
+            inner.stack.cancel_flow(header.src, header.tag.tag());
+            while inner.stack.get_deferred(header.src, header.tag).is_some() {}
+
+            match inner.stack.receive(pkt) {
+                // Complete message
+                Ok(Some(msg)) => {
+                    self.incoming_local(msg);
+                    return ret_src;
+                }
+                // Fragment consumed, message is incomplete
+                Ok(None) => {
+                    return ret_src;
+                }
+                Err(e) => {
+                    debug!("Dropped local recv packet. {}", e);
+                    return ret_src;
+                }
+            }
+        }
+
+        // Look for a route to forward to
+        let (Some(p), _mtu) = inner.lookup.by_eid(header.dest, Some(port))
+        else {
+            debug!("No route for recv {}", header.dest);
+            return ret_src;
+        };
+        drop(inner);
+
+        let Some(top) = self.ports.get(p.0 as usize) else {
+            debug!("Bad port ID from lookup");
+            return ret_src;
+        };
+
+        top.forward_packet(pkt);
+        ret_src
+    }
+
+    #[cfg(feature = "async")]
     async fn incoming_local(&self, msg: MctpMessage<'_>) {
         trace!("incoming local, type {}", msg.typ.0);
         debug_assert!(
@@ -615,6 +851,22 @@ impl<'r> Router<'r> {
         }
     }
 
+    #[cfg(not(feature = "async"))]
+    fn incoming_local(&self, msg: MctpMessage<'_>) {
+        trace!("incoming local, type {}", msg.typ.0);
+        debug_assert!(
+            msg.tag.is_owner() == msg.cookie().is_none(),
+            "cookie set only for responses"
+        );
+
+        if msg.tag.is_owner() {
+            self.incoming_listener(msg)
+        } else {
+            self.incoming_response(msg)
+        }
+    }
+
+    #[cfg(feature = "async")]
     async fn incoming_listener(&self, mut msg: MctpMessage<'_>) {
         // wake the packet listener
         self.app_listeners.lock(|a| {
@@ -635,6 +887,26 @@ impl<'r> Router<'r> {
         });
     }
 
+    #[cfg(not(feature = "async"))]
+    fn incoming_listener(&self, mut msg: MctpMessage<'_>) {
+        // wake the packet listener
+        self.app_listeners.lock(|a| {
+            let mut a = a.borrow_mut();
+            // Find the matching listener
+            for (t, cookie) in a.iter_mut() {
+                if *t == msg.typ {
+                    // Mark the message for that listener
+                    msg.set_cookie(Some(*cookie));
+                    msg.retain();
+                    trace!("listener match");
+                    return;
+                }
+            }
+            trace!("listener no match");
+        });
+    }
+
+    //leongross: TODO: adapt this or remove it?
     async fn incoming_response(&self, mut msg: MctpMessage<'_>) {
         if let Some(cookie) = msg.cookie() {
             msg.retain();
@@ -1073,5 +1345,183 @@ impl<'g, 'r> mctp::AsyncListener for RouterAsyncListener<'g, 'r> {
 impl Drop for RouterAsyncListener<'_, '_> {
     fn drop(&mut self) {
         self.router.app_unbind(self.cookie)
+    }
+}
+
+// Synchronous alternatives
+// For the integraion of non-asynchronous environments, it might be useful or
+// even necessary to provide non-asynchronous alternatives.
+
+/// A listener.
+///
+/// Created with [`Router::listener()`](Router::listener).
+#[derive(Debug)]
+pub struct RouterListener<'g, 'r> {
+    router: &'g Router<'r>,
+    cookie: AppCookie,
+    timeout: Option<u64>,
+}
+
+impl RouterListener<'_, '_> {
+    /// Set a receive timeout.
+    ///
+    /// Specified in milliseconds.
+    pub fn set_timeout(&mut self, timeout: Option<u64>) {
+        self.timeout = timeout;
+    }
+}
+
+// impl<'g, 'r> mctp::AsyncListener for RouterAsyncListener<'g, 'r> {
+//     type RespChannel<'a>
+//         = RouterAsyncRespChannel<'g, 'r>
+//     where
+//         Self: 'a;
+
+impl<'g, 'r> mctp::Listener for RouterListener<'g, 'r> {
+    type RespChannel<'a>
+        = RouterRespChannel<'g, 'r>
+    where
+        Self: 'a;
+
+    fn recv<'f>(
+        &mut self,
+        buf: &'f mut [u8],
+    ) -> Result<(MsgType, MsgIC, &'f mut [u8], Self::RespChannel<'_>)> {
+        let res = RouterRespChannel {
+            eid: Eid(0),
+            tv: TagValue(0),
+            router: self.router,
+            typ: MsgType(0x00),
+        };
+        Ok((MsgType(0x00), MsgIC(true), buf, res))
+    }
+}
+
+/// A request channel.
+#[derive(Debug)]
+pub struct RouterReqChannel<'g, 'r> {
+    /// Destination EID
+    eid: Eid,
+    /// Tag from the last `send()`.
+    ///
+    /// Cleared upon receiving a response, except in the case of !tag_expires.
+    last_tag: Option<Tag>,
+    router: &'g Router<'r>,
+    tag_expires: bool,
+    cookie: Option<AppCookie>,
+    timeout: Option<u64>,
+}
+
+impl<'g, 'r> RouterReqChannel<'g, 'r> {
+    fn new(eid: Eid, router: &'g Router<'r>) -> Self {
+        RouterReqChannel {
+            eid,
+            last_tag: None,
+            tag_expires: true,
+            router,
+            cookie: None,
+            timeout: None,
+        }
+    }
+
+    /// Set the tag to not expire. That allows multiple calls to `send()`.
+    ///
+    /// Should be called prior to any `send()` and may only be called once
+    /// for a `RouterAsyncReqChannel`.
+    /// This can also be called after the `recv()` has completed.
+    pub fn tag_noexpire(&mut self) -> Result<()> {
+        if self.last_tag.is_some() {
+            return Err(Error::BadArgument);
+        }
+        self.tag_expires = false;
+        Ok(())
+    }
+
+    /// Set a timeout.
+    ///
+    /// Specified in milliseconds.
+    pub fn set_timeout(&mut self, timeout: Option<u64>) {
+        self.timeout = timeout;
+    }
+}
+
+impl Drop for RouterReqChannel<'_, '_> {
+    fn drop(&mut self) {
+        if !self.tag_expires && self.last_tag.is_some() {
+            // tag cleanup will require a cookie
+            debug_assert!(self.cookie.is_some());
+        }
+
+        if let Some(c) = self.cookie {
+            self.router.recv_wakers.remove(c);
+        }
+    }
+}
+
+impl mctp::ReqChannel for RouterReqChannel<'_, '_> {
+    fn send_vectored(
+        &mut self,
+        typ: MsgType,
+        integrity_check: MsgIC,
+        bufs: &[&[u8]],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn send(&mut self, typ: MsgType, buf: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn recv<'f>(
+        &mut self,
+        buf: &'f mut [u8],
+    ) -> Result<(MsgType, MsgIC, &'f mut [u8])> {
+        Ok((MsgType(0x00), MsgIC(true), buf))
+    }
+
+    fn remote_eid(&self) -> Eid {
+        Eid(0)
+    }
+}
+
+/// A response channel.
+///
+/// Returned by [`RouterAsyncListener::recv`](mctp::AsyncListener::recv).
+#[derive(Debug)]
+pub struct RouterRespChannel<'g, 'r> {
+    eid: Eid,
+    tv: TagValue,
+    router: &'g Router<'r>,
+    typ: MsgType,
+}
+
+impl<'g, 'r> mctp::RespChannel for RouterRespChannel<'g, 'r> {
+    type ReqChannel = RouterReqChannel<'g, 'r>;
+
+    fn send_vectored(
+        &mut self,
+        integrity_check: MsgIC,
+        bufs: &[&[u8]],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn send(&mut self, buf: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn remote_eid(&self) -> Eid {
+        Eid(0)
+    }
+
+    fn req_channel(&self) -> Result<Self::ReqChannel> {
+        Ok(RouterReqChannel {
+            eid: Eid(0),
+            last_tag: None,
+            router: self.router,
+            tag_expires: false,
+            cookie: None,
+            timeout: Some(0u64),
+        })
     }
 }
