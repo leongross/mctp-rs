@@ -77,7 +77,8 @@ async fn receive_loop(
 
 /// Run a loop forwarding packets between routera and routerb.
 ///
-/// The `test` Future runs to completion.
+/// The `test` Future runs to completion
+#[cfg(feature = "async")]
 async fn router_loop(routera: &Router<'_>, routerb: &Router<'_>) -> ! {
     let port1 = routera.port(PortId(0)).unwrap();
     let port2 = routerb.port(PortId(0)).unwrap();
@@ -90,6 +91,15 @@ async fn router_loop(routera: &Router<'_>, routerb: &Router<'_>) -> ! {
     }
 }
 
+#[cfg(not(feature = "async"))]
+fn router_loop(routera: &Router<'_>, routerb: &Router<'_>) -> ! {
+    let port1 = routera.port(PortId(0)).unwrap();
+    let port2 = routerb.port(PortId(0)).unwrap();
+    let a = receive_loop("a", routerb, port1.id(), port1);
+    let b = receive_loop("b", routera, port2.id(), port2);
+}
+
+#[cfg(feature = "async")]
 fn run<F, R>(routera: &Router<'_>, routerb: &Router<'_>, test: F) -> R
 where
     F: Future<Output = R>,
@@ -104,6 +114,17 @@ where
             _ = pktloop.fuse() => unreachable!(),
         }
     })
+}
+
+#[cfg(not(feature = "async"))]
+fn run<F, R>(routera: &Router<'_>, routerb: &Router<'_>, test: FnOnce) -> R
+where
+    F: FnOnce,
+{
+    let pktloop = router_loop(routera, routerb);
+    let res test();
+    info!("Finished");
+    res
 }
 
 fn routers<'r>(
@@ -146,6 +167,37 @@ fn router_requests() {
         assert_eq!(payload, b"second");
         resp.send(b"reply2").await.unwrap();
         let (_t, _ic, payload) = reqb.recv(&mut buf).await.unwrap();
+        assert_eq!(payload, b"reply2");
+    });
+}
+
+#[test]
+#[cfg(not(feature = "async"))]
+fn router_requests() {
+    let mut tops = [PortTop::new(), PortTop::new()];
+    let (routera, routerb) =
+        routers(&mut tops, &DEFAULT_LOOKUP, &DEFAULT_LOOKUP);
+
+    run(&routera, &routerb, |_|{
+        let typ = MsgType(0x33);
+        let mut buf = [0u8; 1000];
+
+        let mut lista = routera.listener(typ).unwrap();
+        let mut reqb = routerb.req(routera.get_eid();
+
+        reqb.send(typ, b"first").unwrap();
+        reqb.send(typ, b"second").unwrap();
+
+        // check first request
+        let (_t, _ic, payload, _resp) = lista.recv(&mut buf).unwrap();
+        assert_eq!(payload, b"first");
+
+        // respond only to the second request
+        let (_t, _ic, payload, mut resp) = lista.recv(&mut buf).unwrap();
+        assert_eq!(payload, b"second");
+        resp.send(b"reply2").unwrap();
+
+        let (_t, _ic, payload) = reqb.recv(&mut buf).unwrap();
         assert_eq!(payload, b"reply2");
     });
 }
