@@ -8,7 +8,9 @@
 
 use crate::fmt::*;
 use crate::Router;
-use mctp::{AsyncRespChannel, Eid, Error, Listener, MsgIC, MsgType};
+use mctp::{
+    AsyncRespChannel, Eid, Error, Listener, MsgIC, MsgType, RespChannel,
+};
 use uuid::Uuid;
 
 /// A `Result` with a MCTP control completion code as error.
@@ -447,6 +449,7 @@ impl<'g, 'r> MctpControl<'g, 'r> {
     /// May return `Err` if a message cannot be handled (no response sent),
     /// for example incorrect header.
     /// Will return `Ok` if an error completion code response was sent.
+    #[cfg(feature = "async")]
     pub async fn handle_async(
         &mut self,
         msg: &[u8],
@@ -473,6 +476,32 @@ impl<'g, 'r> MctpControl<'g, 'r> {
         Ok(ev)
     }
 
+    // TODO: rename this since it is not async
+    #[cfg(not(feature = "async"))]
+    pub fn handle_async(
+        &mut self,
+        msg: &[u8],
+        mut resp_chan: impl RespChannel,
+    ) -> mctp::Result<Option<ControlEvent>> {
+        let req = MctpControlMsg::from_buf(msg).map_err(|e| {
+            // Can't send a response since request couldn't be parsed
+            debug!("Bad control input {:?}", e);
+            mctp::Error::InvalidInput
+        })?;
+
+        let (mut resp, ev) = match self.handle_req(&req, resp_chan.remote_eid())
+        {
+            Err(e) => {
+                debug!("Control error response {:?}", e);
+                respond_error(&req, e, &mut self.rsp_buf).map(|r| (r, None))
+            }
+            Ok(r) => Ok(r),
+        }?;
+
+        resp_chan.send_vectored(MsgIC(false), &resp.slices())?;
+        Ok(ev)
+    }
+
     /// Set MCTP message types to be reported by the handler.
     pub fn set_message_types(&mut self, types: &[MsgType]) -> mctp::Result<()> {
         if types.len() > self.types.capacity() {
@@ -489,6 +518,7 @@ impl<'g, 'r> MctpControl<'g, 'r> {
         let _ = self.uuid.insert(*uuid);
     }
 
+    #[cfg(feature = "async")]
     async fn handle_req(
         &mut self,
         req: &'_ MctpControlMsg<'_>,
@@ -514,6 +544,65 @@ impl<'g, 'r> MctpControl<'g, 'r> {
                 let old = self.router.get_eid().await;
                 let res = self.router.set_eid(eid).await;
                 let present_eid = self.router.get_eid().await;
+
+                if res.is_ok() {
+                    event = Some(ControlEvent::SetEndpointId {
+                        old,
+                        new: present_eid,
+                        bus_owner: source_eid,
+                    });
+                }
+
+                respond_set_eid(
+                    req,
+                    res.is_ok(),
+                    present_eid,
+                    &mut self.rsp_buf,
+                )
+            }
+            CommandCode::GetEndpointUUID => {
+                if let Some(uuid) = self.uuid {
+                    respond_get_uuid(req, uuid, &mut self.rsp_buf)
+                } else {
+                    Err(CompletionCode::ERROR_UNSUPPORTED_CMD)
+                }
+            }
+            CommandCode::GetMessageTypeSupport => respond_get_msg_types(
+                req,
+                self.types.as_slice(),
+                &mut self.rsp_buf,
+            ),
+            _ => Err(CompletionCode::ERROR_UNSUPPORTED_CMD),
+        }
+        .map(|r| (r, event))
+    }
+
+    #[cfg(not(feature = "async"))]
+    fn handle_req(
+        &mut self,
+        req: &'_ MctpControlMsg<'_>,
+        source_eid: Eid,
+    ) -> ControlResult<(MctpControlMsg<'_>, Option<ControlEvent>)> {
+        let cc = req.command_code();
+
+        let mut event = None;
+        #[cfg(feature = "log")]
+        debug!("Control request {:?}", cc);
+        match cc {
+            CommandCode::GetEndpointID => {
+                let eid = self.router.get_eid();
+                respond_get_eid(req, eid, 0, &mut self.rsp_buf)
+            }
+            CommandCode::SetEndpointID => {
+                let (SetEndpointId::Set(eid) | SetEndpointId::Force(eid)) =
+                    parse_set_eid(req)?
+                else {
+                    // Don't support Reset or SetDiscovered
+                    return Err(CompletionCode::ERROR_INVALID_DATA);
+                };
+                let old = self.router.get_eid();
+                let res = self.router.set_eid(eid);
+                let present_eid = self.router.get_eid();
 
                 if res.is_ok() {
                     event = Some(ControlEvent::SetEndpointId {
